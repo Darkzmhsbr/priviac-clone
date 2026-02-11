@@ -6,69 +6,87 @@ r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 async def list_media(username: str):
     username = username.lower()
     
+    # 1. Recupera cookies
     cookie_data = r.get("privacy_cookies")
     if not cookie_data:
-        print("ERRO: Cookies não encontrados.")
+        print("ERRO: Cookies não encontrados no Redis.")
         return []
     
     cookies = json.loads(cookie_data)
 
-    # Impersonate 'chrome120' é ótimo, mas se falhar, tentaremos ser mais simples na proxima
+    # 2. Sessão Chrome
     async with AsyncSession(cookies=cookies, impersonate="chrome120") as s:
-        # Headers mínimos e essenciais (muitos headers as vezes atrapalham)
-        s.headers.update({
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://privacy.com.br/profile/{username}",
-            "Origin": "https://privacy.com.br",
-            "X-Requested-With": "XMLHttpRequest"
-        })
-
-        print(f"Buscando API Feed para: {username}...")
-        api_url = f"https://privacy.com.br/api/v1/feed/profile/{username}?offset=0&limit=20"
+        print(f"Acessando perfil visual: {username}...")
+        
+        # Vamos direto na página do perfil (já que a API redireciona pra lá mesmo)
+        url = f"https://privacy.com.br/profile/{username}"
         
         try:
-            resp = await s.get(api_url)
+            resp = await s.get(url)
             
-            # Se não for JSON, vamos descobrir o que é
-            try:
-                data = resp.json()
-            except json.JSONDecodeError:
-                print(f"❌ ERRO DE BLOQUEIO (Status {resp.status_code})")
-                print("O site devolveu HTML em vez de JSON. Veja o conteúdo:")
-                
-                # Pega o título da página para saber o erro
-                try:
-                    html_content = resp.text
-                    title_start = html_content.find("<title>") + 7
-                    title_end = html_content.find("</title>")
-                    if title_start > 6 and title_end > title_start:
-                        print(f"Título da Página: {html_content[title_start:title_end]}")
-                    else:
-                        print(f"Início do conteúdo: {html_content[:100]}")
-                except:
-                    pass
+            # 3. Procura os dados escondidos no HTML
+            html = resp.text
+            
+            # O tesouro está dentro da tag <script id="__NEXT_DATA__">
+            start_tag = '<script id="__NEXT_DATA__" type="application/json">'
+            end_tag = '</script>'
+            
+            start_index = html.find(start_tag)
+            if start_index == -1:
+                print(f"ERRO: Tag de dados não encontrada. Título da página: {html[html.find('<title>'):html.find('</title>')]}")
                 return []
-
-            # Se chegou aqui, é JSON válido!
-            if not data.get("success"):
-                print("API respondeu success=false. Perfil privado ou erro de conta.")
-                return []
-
-            posts = data.get("value", [])
+            
+            # Recorta só o JSON
+            json_start = start_index + len(start_tag)
+            json_end = html.find(end_tag, json_start)
+            json_str = html[json_start:json_end]
+            
+            data = json.loads(json_str)
+            
+            # 4. Navega pelo JSON para achar a mídia
+            # A estrutura muda às vezes, então vamos tentar vários caminhos
             media_list = []
+            
+            # Caminho 1: Dados do Perfil Direto
+            try:
+                profile_data = data["props"]["pageProps"]["initialState"]["profile"]
+                if "media" in profile_data:
+                    raw_media = profile_data["media"]
+                else:
+                    # Caminho 2: React Query (Dehydrated State) - Mais comum hoje em dia
+                    queries = data["props"]["pageProps"]["dehydratedState"]["queries"]
+                    raw_media = []
+                    for q in queries:
+                        # Procura a query que tem dados de 'media' ou 'feed'
+                        if "state" in q and "data" in q["state"]:
+                            content = q["state"]["data"]
+                            # Pode estar dentro de 'profile' -> 'media'
+                            if "profile" in content and "media" in content["profile"]:
+                                raw_media.extend(content["profile"]["media"])
+                            # Ou pode ser uma lista de posts direta
+                            elif "value" in content and isinstance(content["value"], list):
+                                # Verifica se parece post de feed
+                                raw_media.extend(content["value"])
 
-            for post in posts:
-                if post.get("files"):
-                    for file in post["files"]:
-                        media_list.append({
-                            "id": file.get("id"),
-                            "url": file.get("url"),
-                            "type": file.get("type")
-                        })
+            except Exception as e:
+                print(f"Aviso: Falha ao navegar na estrutura padrão ({e}). Tentando busca bruta...")
+                raw_media = []
 
-            print(f"🎉 SUCESSO! {len(media_list)} mídias extraídas.")
+            # 5. Extrai os links limpos
+            # Agora varremos o que achamos para pegar só id e url
+            for item in raw_media:
+                # Se for estrutura de Mídia direta
+                if "url" in item and "type" in item:
+                     media_list.append(item)
+                
+                # Se for estrutura de Post (tem arquivos dentro)
+                elif "files" in item:
+                    for f in item["files"]:
+                        media_list.append(f)
+
+            print(f"🎉 SUCESSO ABSOLUTO! {len(media_list)} mídias encontradas na página.")
             return media_list
 
         except Exception as e:
-            print(f"Erro crítico: {e}")
+            print(f"Erro crítico no scraper: {e}")
             return []
