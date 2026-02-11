@@ -8,8 +8,22 @@ async def login_privacy(email: str, password: str):
         print("ERRO: Email ou Senha vazios.")
         return None
 
-    async with AsyncSession(impersonate="chrome") as s:
-        print(f"Tentando logar: {email}...")
+    # Usamos chrome120 para garantir uma assinatura digital moderna
+    async with AsyncSession(impersonate="chrome120") as s:
+        print(f"Iniciando fluxo de login para: {email}...")
+
+        # PASSO 1: AQUECIMENTO (Acessar a página de login para pegar cookies de sessão/CSRF)
+        # Isso engana o sistema de segurança, mostrando que somos um navegador "visitando" o site
+        try:
+            print("1. Acessando página de login (Aquecimento)...")
+            await s.get("https://privacy.com.br/auth/login")
+        except Exception as e:
+            print(f"Erro no aquecimento: {e}")
+            return None
+
+        # PASSO 2: O LOGIN REAL
+        # Agora que já temos os cookies da visita, mandamos as credenciais
+        print("2. Enviando credenciais...")
         
         payload = {
             "userName": email,
@@ -17,38 +31,45 @@ async def login_privacy(email: str, password: str):
             "keepConnected": True
         }
         
+        # Headers essenciais para parecer que o clique veio do botão de login
+        s.headers.update({
+            "Origin": "https://privacy.com.br",
+            "Referer": "https://privacy.com.br/auth/login",
+            "X-Requested-With": "XMLHttpRequest" # Diz que é uma chamada de site moderno (AJAX)
+        })
+        
         try:
-            # Bate na API de Login
             resp = await s.post("https://privacy.com.br/api/v1/account/login", json=payload)
             
-            # Converte a resposta para JSON ( dicionário Python )
+            # Debug se falhar o JSON
             try:
                 data = resp.json()
             except:
-                print(f"ERRO: API não retornou JSON. Texto: {resp.text[:100]}")
+                # Se não vier JSON, provavelmente fomos bloqueados ou redirecionados
+                print(f"ERRO: Resposta não é JSON. Status: {resp.status_code}")
+                # Salva o HTML para você ver o erro real se precisar
+                # print(f"Conteúdo recebido: {resp.text[:200]}") 
                 return None
 
-            # AQUI ESTÁ A CORREÇÃO: Verifica se success é True
+            # PASSO 3: VALIDAÇÃO
             if data.get("success") is True and data.get("authenticated") is True:
-                print("Login CONFIRMADO! Cookies capturados.")
+                print("LOGIN COM SUCESSO! 🔓")
                 
-                # Pega os cookies da sessão
                 cookies = s.cookies.get_dict()
                 
-                # Debug: Mostra se pegou o cookie principal (auth_token)
+                # Verificação extra de segurança
                 if "auth_token" in cookies:
-                    print("Cookie 'auth_token' encontrado! Acesso garantido.")
+                    print("Cookie Mestre (auth_token) capturado.")
                 else:
-                    print("AVISO: 'auth_token' não encontrado nos cookies (Pode dar erro).")
+                    print("AVISO: Logou, mas auth_token não apareceu. Pode falhar no download.")
 
                 r.setex("privacy_cookies", 3600, json.dumps(cookies))
                 return cookies
             else:
-                # Se o login falhou (senha errada, etc), mostra o erro real
                 msg = data.get("message", "Erro desconhecido")
-                print(f"FALHA NO LOGIN: {msg}")
+                print(f"FALHA NO LOGIN (Recusado pelo site): {msg}")
                 return None
 
         except Exception as e:
-            print(f"Erro crítico no login: {e}")
+            print(f"Erro crítico durante o POST de login: {e}")
             return None
