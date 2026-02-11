@@ -1,17 +1,29 @@
 from fastapi import FastAPI
-import os, json, asyncio
+import os
 from telegram import Bot
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")          # virá das variáveis do Railway
-bot = Bot(BOT_TOKEN)
+# Pega o token das variáveis de ambiente
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 app = FastAPI()
 
-@app.get("/")
-def home():
-    return {"status": "on-line", "bot": bot.get_me().username}
+# Inicializa o bot (no modo assíncrono v20+, a inicialização é leve)
+# Se o token não existir, evitamos quebrar o app logo no início
+if BOT_TOKEN:
+    bot = Bot(BOT_TOKEN)
+else:
+    bot = None
 
-# health-check que o Railway usa para saber se o container está vivo
+@app.get("/")
+async def home():  # <--- MUDANÇA 1: Adicionado 'async'
+    if not bot:
+        return {"status": "erro", "detalhe": "BOT_TOKEN não configurado no Railway"}
+    
+    # <--- MUDANÇA 2: Adicionado 'await' para esperar o Telegram responder
+    bot_info = await bot.get_me() 
+    
+    return {"status": "on-line", "bot": bot_info.username}
+
 @app.get("/health")
 def health():
-    
-    return "ok"
+    return {"status": "ok"}
