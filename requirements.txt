@@ -1,5 +1,6 @@
 python-telegram-bot==20.7
 requests==2.31
 playwright==1.40
+greenlet>=3.3.1  # adicione essa linha
 aiofiles==23.2
 redis==5.0
