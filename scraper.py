@@ -1,43 +1,40 @@
-import os, redis, json, httpx
-from bs4 import BeautifulSoup  # Se der erro de falta, avise, mas geralmente o pacote basicos tem. 
-# Caso não tenha bs4, faremos via texto puro para garantir. Vou usar TEXTO PURO para não precisar instalar nada novo.
+import os, redis, json
+from curl_cffi.requests import AsyncSession
 
 r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 
 async def list_media(username: str):
     # Recupera cookies
     cookie_data = r.get("privacy_cookies")
-    jar = json.loads(cookie_data) if cookie_data else {}
+    cookies = json.loads(cookie_data) if cookie_data else {}
     
-    # Headers de navegador real
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Referer": "https://privacy.com.br/",
-    }
-
-    async with httpx.AsyncClient(cookies=jar, headers=headers, follow_redirects=True) as cli:
-        # Acessa a página do perfil (Porta da Frente)
-        print(f"Acessando perfil: {username}...")
-        resp = await cli.get(f"https://privacy.com.br/profile/{username}")
+    # Camuflagem perfeita de Chrome
+    async with AsyncSession(cookies=cookies, impersonate="chrome") as s:
+        print(f"Acessando perfil (Modo Chrome): {username}...")
+        
+        # Acessa a página
+        resp = await s.get(f"https://privacy.com.br/profile/{username}")
         
         if resp.status_code != 200:
-            print(f"Erro ao acessar perfil: {resp.status_code}")
+            print(f"Erro HTTP: {resp.status_code}")
             return []
 
-        # Procura pelo JSON escondido no HTML (Next.js Data)
         html = resp.text
+        
+        # Procura o JSON mágico (__NEXT_DATA__)
         start_tag = '<script id="__NEXT_DATA__" type="application/json">'
         end_tag = '</script>'
         
         start_index = html.find(start_tag)
         if start_index == -1:
-            print("ERRO: Não foi possível encontrar os dados na página (Estrutura mudou ou bloqueio severo).")
-            # Salva o HTML para debug se precisar
-            # with open("debug_error.html", "w", encoding="utf-8") as f: f.write(html)
+            # Se cair aqui, vamos ver o título da página para saber se é bloqueio
+            title_start = html.find('<title>')
+            title_end = html.find('</title>')
+            title = html[title_start:title_end] if title_start != -1 else "Sem título"
+            print(f"ERRO: Dados não encontrados. Título da página: {title}")
             return []
             
-        # Extrai apenas o pedaço do JSON
+        # Extrai e converte o JSON
         start_index += len(start_tag)
         end_index = html.find(end_tag, start_index)
         json_str = html[start_index:end_index]
@@ -45,18 +42,21 @@ async def list_media(username: str):
         try:
             data = json.loads(json_str)
             
-            # Navega até a mídia (O caminho pode variar, vamos tentar o padrão)
-            # Geralmente: props -> pageProps -> initialState -> profile -> media
-            profile_data = data.get("props", {}).get("pageProps", {}).get("initialState", {}).get("profile", {})
-            
-            if not profile_data:
-                # Tenta outro caminho comum
-                profile_data = data.get("props", {}).get("pageProps", {}).get("dehydratedState", {}).get("queries", [{}])[0].get("state", {}).get("data", {}).get("profile", {})
+            # Navega até a mídia (Caminho padrão do Privacy)
+            try:
+                profile = data["props"]["pageProps"]["initialState"]["profile"]
+            except KeyError:
+                # Tenta caminho alternativo
+                try:
+                    profile = data["props"]["pageProps"]["dehydratedState"]["queries"][0]["state"]["data"]["profile"]
+                except:
+                    print("Estrutura do JSON mudou ou perfil não carregou.")
+                    return []
 
-            media = profile_data.get("media", [])
+            media = profile.get("media", [])
             print(f"Sucesso! Encontradas {len(media)} mídias.")
             return media
 
         except Exception as e:
-            print(f"Erro ao processar dados da página: {e}")
+            print(f"Erro ao processar JSON: {e}")
             return []
