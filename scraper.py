@@ -6,46 +6,72 @@ r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 async def list_media(username: str):
     username = username.lower()
     
+    # 1. Recupera o cookie
     cookie_data = r.get("privacy_cookies")
     if not cookie_data:
-        print("ERRO: Nenhum cookie encontrado no Redis.")
+        print("ERRO: Cookies não encontrados no Redis.")
         return []
-        
-    cookies = json.loads(cookie_data)
     
-    # Camuflagem de Chrome
-    async with AsyncSession(cookies=cookies, impersonate="chrome120") as s:
-        url = f"https://privacy.com.br/profile/{username}"
-        print(f"Acessando: {url}")
-        
-        resp = await s.get(url)
-        
-        # Verifica se caiu no Checkout (login inválido)
-        if "Checkout" in resp.text or "<title>Privacy | Checkout" in resp.text:
-            print("ERRO FATAL: Redirecionado para Checkout. O Cookie Mestre pode ter expirado ou estar errado.")
-            return []
+    cookies = json.loads(cookie_data)
 
-        html = resp.text
-        start_tag = '<script id="__NEXT_DATA__" type="application/json">'
-        end_tag = '</script>'
-        
-        start_index = html.find(start_tag)
-        if start_index == -1:
-            print("ERRO: Dados da página não encontrados. O site pode ter mudado o layout.")
-            return []
-            
-        json_str = html[start_index + len(start_tag) : html.find(end_tag, start_index)]
+    # 2. Configura a sessão simulando Chrome
+    async with AsyncSession(cookies=cookies, impersonate="chrome120") as s:
+        # Headers para parecer uma chamada legítima do frontend (XHR)
+        s.headers.update({
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://privacy.com.br/profile/{username}",
+            "Origin": "https://privacy.com.br",
+            "X-Requested-With": "XMLHttpRequest"
+        })
+
+        print(f"Buscando via API para: {username}...")
+
+        # 3. TENTATIVA 1: API de Feed (Onde ficam os posts/mídia)
+        # Traz os primeiros 20 posts
+        api_url = f"https://privacy.com.br/api/v1/feed/profile/{username}?offset=0&limit=20"
         
         try:
-            data = json.loads(json_str)
-            try:
-                media = data["props"]["pageProps"]["initialState"]["profile"]["media"]
-            except KeyError:
-                media = data["props"]["pageProps"]["dehydratedState"]["queries"][0]["state"]["data"]["profile"]["media"]
-                
-            print(f"Sucesso! Encontradas {len(media)} mídias.")
-            return media
+            resp = await s.get(api_url)
+            
+            # --- DEBUG DE RESPOSTA ---
+            if resp.status_code != 200:
+                print(f"ERRO API ({resp.status_code}): Título da página recebida:")
+                # Tenta ler o título do HTML de erro para sabermos se é Cloudflare
+                try:
+                    title_start = resp.text.find("<title>") + 7
+                    title_end = resp.text.find("</title>")
+                    print(resp.text[title_start:title_end] if title_start > 6 else "Sem título")
+                except:
+                    pass
+                return []
+
+            # 4. Processa o JSON
+            data = resp.json()
+            
+            if not data.get("success"):
+                print("API respondeu 200 mas com success: false (Provável bloqueio ou perfil inexistente).")
+                return []
+
+            posts = data.get("value", [])
+            media_list = []
+
+            print(f"Processando {len(posts)} posts da API...")
+
+            for post in posts:
+                # Verifica se tem mídia no post
+                if post.get("files"):
+                    for file in post["files"]:
+                        # Filtra apenas vídeos ou imagens se quiser
+                        # type: 'video', 'image'
+                        media_list.append({
+                            "id": file.get("id"),
+                            "url": file.get("url"),
+                            "type": file.get("type")
+                        })
+
+            print(f"Sucesso! Extraídas {len(media_list)} mídias da API.")
+            return media_list
 
         except Exception as e:
-            print(f"Erro ao ler JSON da página: {e}")
+            print(f"Erro ao processar API: {e}")
             return []
