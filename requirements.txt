@@ -8,3 +8,4 @@ requests==2.31
 python-telegram-bot==20.7
 aiohttp==3.9.3
 httpx==0.25.2
+beautifulsoup4==4.12.3
