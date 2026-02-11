@@ -3,45 +3,40 @@ from curl_cffi.requests import AsyncSession
 
 r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 
-async def login_privacy(email: str, password: str):
-    # --- MODO BYPASS MANUAL ---
-    cookie_mestre = os.getenv("COOKIE_MASTER")
+def parse_cookie_string(cookie_string):
+    """Transforma a string bruta do navegador em um dicionário Python"""
+    cookies = {}
+    if not cookie_string:
+        return cookies
     
-    if cookie_mestre:
-        print("🚀 MODO BYPASS: Usando Cookie Mestre (.AspNetCore.Cookies)!")
+    # Separa por ponto e vírgula
+    items = cookie_string.split(';')
+    for item in items:
+        if '=' in item:
+            name, value = item.split('=', 1)
+            cookies[name.strip()] = value.strip()
+    return cookies
+
+async def login_privacy(email: str, password: str):
+    # --- MODO BYPASS TOTAL (Cookies Brutos) ---
+    cookie_master = os.getenv("COOKIE_MASTER")
+    
+    if cookie_master:
+        print("🚀 MODO BYPASS: Processando string completa de cookies...")
         
-        # AQUI ESTÁ A CORREÇÃO: Usamos o nome que aparece na sua imagem
-        cookies = {
-            ".AspNetCore.Cookies": cookie_mestre, 
-            "accepted-privacy-terms": "1",
-            "user-accepted-cookies": "true"
-        }
+        # Transforma o texto gigante em dicionário
+        cookies = parse_cookie_string(cookie_master)
         
-        # Se houver um cookie de sessão secundário, tentamos adicionar (opcional)
-        # cookies[".AspNetCore.Session"] = "..." 
-        
+        # Verifica se tem os essenciais
+        if ".AspNetCore.Cookies" in cookies:
+            print(f"Cookie principal detectado! (Carregados {len(cookies)} cookies auxiliares)")
+        else:
+            print("AVISO: String carregada, mas não achei o .AspNetCore.Cookies. Pode falhar.")
+
+        # Salva no Redis
         r.setex("privacy_cookies", 3600, json.dumps(cookies))
         return cookies
 
-    # --- MODO AUTOMÁTICO (Só roda se não tiver cookie mestre) ---
-    print("Tentando login automático (Não recomendado se tiver COOKIE_MASTER)...")
-    async with AsyncSession(impersonate="chrome120") as s:
-        try:
-            await s.get("https://privacy.com.br/auth/login")
-            payload = {"userName": email, "password": password, "keepConnected": True}
-            s.headers.update({"Origin": "https://privacy.com.br", "Referer": "https://privacy.com.br/auth/login"})
-            
-            resp = await s.post("https://privacy.com.br/api/v1/account/login", json=payload)
-            data = resp.json()
-
-            if data.get("success") is True:
-                print("Login automático SUCESSO!")
-                cookies = s.cookies.get_dict()
-                r.setex("privacy_cookies", 3600, json.dumps(cookies))
-                return cookies
-            else:
-                print(f"Falha login: {data.get('message')}")
-                return None
-        except Exception as e:
-            print(f"Erro login auto: {e}")
-            return None
+    # --- MODO AUTOMÁTICO (Desativado se tiver Cookie Master) ---
+    print("ERRO: COOKIE_MASTER inválido ou vazio. O login automático falhou anteriormente.")
+    return None
