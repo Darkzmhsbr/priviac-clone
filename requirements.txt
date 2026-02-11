@@ -1,5 +1,5 @@
 playwright==1.40
-greenlet==3.0.1      # <-- deixe fixo
+greenlet==3.0.1
 aiofiles==23.2
 redis==5.0
 requests==2.31
