@@ -1,4 +1,4 @@
-import os, redis, json
+import os, redis, json, re
 from curl_cffi.requests import AsyncSession
 
 r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
@@ -6,7 +6,7 @@ r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
 async def list_media(username: str):
     username = username.lower()
     
-    # 1. Recupera cookies (já limpos pelo auth.py)
+    # 1. Recupera cookies (Login já validado!)
     cookie_data = r.get("privacy_cookies")
     if not cookie_data:
         print("ERRO: Cookies não encontrados no Redis.")
@@ -16,72 +16,77 @@ async def list_media(username: str):
 
     # 2. Sessão Chrome
     async with AsyncSession(cookies=cookies, impersonate="chrome120") as s:
-        # Headers idênticos aos de uma navegação real (feed)
+        # Headers simples de navegador
         s.headers.update({
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://privacy.com.br/profile/{username}",
-            "Origin": "https://privacy.com.br",
-            "X-Requested-With": "XMLHttpRequest"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Referer": "https://privacy.com.br/",
         })
 
-        print(f"📡 Tentando API Feed para: {username}...")
-        
-        # URL da API que carrega o feed (Offset 0 = posts mais recentes)
-        api_url = f"https://privacy.com.br/api/v1/feed/profile/{username}?offset=0&limit=20"
+        print(f"🕵️‍♂️ Acessando perfil visual: {username}...")
+        url = f"https://privacy.com.br/profile/{username}"
         
         try:
-            resp = await s.get(api_url)
-            
-            # --- DIAGNÓSTICO DE ERRO (O Pulo do Gato) ---
-            if resp.status_code != 200:
-                print(f"❌ ERRO API: Status {resp.status_code}")
-                # Mostra o título da página de erro para sabermos se é Cloudflare
-                if "<title>" in resp.text:
-                    start = resp.text.find("<title>") + 7
-                    end = resp.text.find("</title>")
-                    print(f"📄 Título da página recebida: {resp.text[start:end]}")
-                else:
-                    print(f"📄 Conteúdo (início): {resp.text[:200]}")
-                return []
-            
-            # Verifica se veio JSON ou se o site devolveu HTML disfarçado de 200
-            try:
-                data = resp.json()
-            except json.JSONDecodeError:
-                print("⚠️ ALERTA: O site retornou 200 OK, mas o conteúdo é HTML (Bloqueio).")
-                if "<title>" in resp.text:
-                    start = resp.text.find("<title>") + 7
-                    end = resp.text.find("</title>")
-                    print(f"📄 Título real da página: {resp.text[start:end]}")
+            resp = await s.get(url)
+            html = resp.text
+
+            # Verificação básica de bloqueio
+            if "Just a moment" in html or "Access denied" in html:
+                print("❌ ERRO: Bloqueio visual do Cloudflare detectado.")
                 return []
 
-            # Se chegou aqui, temos dados!
-            if not data.get("success"):
-                print(f"⚠️ API Recusou: {data.get('error') or data.get('message') or 'Sem mensagem'}")
-                return []
-
-            posts = data.get("value", [])
+            # 3. MODO VARREDURA TOTAL (REGEX)
+            # Procura por qualquer texto que pareça um link de vídeo/imagem
+            print("🔍 Varrendo código fonte em busca de arquivos .mp4 e imagens...")
+            
             media_list = []
+            seen_urls = set()
 
-            print(f"🔎 Analisando {len(posts)} posts...")
-
-            for post in posts:
-                # Onde a mágica acontece: extrai vídeos e imagens
-                if post.get("files"):
-                    for file in post["files"]:
-                        media_list.append({
-                            "id": file.get("id"),
-                            "url": file.get("url"),
-                            "type": file.get("type", "unknown")
-                        })
+            # PADRÃO DE BUSCA:
+            # Procura strings que começam com http/https, podem ter barras escapadas (\/) 
+            # e terminam com .mp4
+            video_pattern = re.compile(r'https:(?:\\/|/)(?:\\/|/)[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:\\/|/)[^"\'\s<>]+\.mp4')
             
-            if len(media_list) > 0:
-                print(f"🎉 SUCESSO! {len(media_list)} mídias encontradas via API.")
-            else:
-                print("⚠️ Acesso permitido, mas nenhuma mídia encontrada nos primeiros 20 posts.")
+            # Padrão para imagens (opcional, filtra avatares depois)
+            image_pattern = re.compile(r'https:(?:\\/|/)(?:\\/|/)[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:\\/|/)[^"\'\s<>]+\.(?:jpg|jpeg|png)')
 
+            # --- Extraindo Vídeos ---
+            videos = video_pattern.findall(html)
+            for v in videos:
+                # Corrige as barras invertidas do JSON (ex: https:\/\/ -> https://)
+                clean_url = v.replace("\\/", "/")
+                
+                if clean_url not in seen_urls:
+                    # Gera um ID falso baseado no final da URL para controle
+                    media_list.append({
+                        "id": "vid_" + clean_url[-15:], 
+                        "url": clean_url, 
+                        "type": "video"
+                    })
+                    seen_urls.add(clean_url)
+
+            # --- Extraindo Imagens ---
+            images = image_pattern.findall(html)
+            for i in images:
+                clean_url = i.replace("\\/", "/")
+                
+                # Filtra ícones de site e avatares pequenos para não sujar o download
+                if clean_url not in seen_urls and "avatar" not in clean_url and "favicon" not in clean_url:
+                    media_list.append({
+                        "id": "img_" + clean_url[-15:], 
+                        "url": clean_url, 
+                        "type": "image"
+                    })
+                    seen_urls.add(clean_url)
+
+            print(f"🎉 VARREDURA FINALIZADA! {len(media_list)} mídias encontradas.")
+            
+            # Debug se não achar nada
+            if len(media_list) == 0:
+                print("⚠️ Nenhuma mídia encontrada. Verifique se o perfil tem posts públicos ou se a assinatura está ativa.")
+                # print(f"Amostra do HTML: {html[:500]}") # Descomente se precisar debugar
+            
             return media_list
 
         except Exception as e:
-            print(f"🔥 Erro crítico no scraper: {e}")
+            print(f"🔥 Erro no scraper: {e}")
             return []
