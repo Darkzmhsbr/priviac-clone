@@ -13,115 +13,156 @@ async def list_media(username: str):
         return []
     cookies = json.loads(cookie_data)
 
-    async with AsyncSession(cookies=cookies, impersonate="chrome120") as s:
-        # Headers para parecer navegação real
+    # 2. Sessão: Mudamos para 'chrome' genérico para tentar pegar a versão mais recente
+    async with AsyncSession(cookies=cookies, impersonate="chrome") as s:
         s.headers.update({
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://privacy.com.br/profile/{username}",
-            "Origin": "https://privacy.com.br"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://privacy.com.br/",
+            "Origin": "https://privacy.com.br",
+            "Upgrade-Insecure-Requests": "1"
         })
 
         media_list = []
-        
-        # --- TENTATIVA 1: API DIRETA (Melhor qualidade) ---
-        print(f"📡 Tentando API Feed para: {username}...")
-        try:
-            # Timestamp para evitar cache
-            api_url = f"https://privacy.com.br/api/v1/feed/profile/{username}?offset=0&limit=20"
-            resp = await s.get(api_url)
-            
-            # Verifica se veio JSON real
-            try:
-                data = resp.json()
-                # Se for HTML disfarçado, vai dar erro aqui ou na checagem de success
-                if data.get("success") and "value" in data:
-                    print(f"✅ API respondeu! Processando {len(data['value'])} posts...")
-                    for post in data["value"]:
-                        if post.get("files"):
-                            for file in post["files"]:
-                                media_list.append({
-                                    "id": file.get("id"),
-                                    "url": file.get("url"),
-                                    "type": file.get("type", "unknown")
-                                })
-            except:
-                print("⚠️ API retornou HTML (Bloqueio ou Redirecionamento). Indo para Plano B...")
-        except Exception as e:
-            print(f"Erro na API: {e}")
+        found_urls = set()
 
-        # --- TENTATIVA 2: LEITURA PROFUNDA DA PÁGINA (Plano B) ---
-        if not media_list:
-            print("🕵️‍♂️ Acessando página do perfil para busca profunda...")
-            try:
-                # Mudamos o header para aceitar HTML agora
-                s.headers.update({"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
-                resp = await s.get(f"https://privacy.com.br/profile/{username}")
-                html = resp.text
-                
-                # BUSCA INTELIGENTE DO NEXT_DATA (Regex robusto)
-                # Procura: <script ... id="__NEXT_DATA__" ... > ...json... </script>
-                # Não importa a ordem dos atributos (id, type, etc)
-                script_pattern = re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
-                match = script_pattern.search(html)
-                
-                if match:
-                    print("📦 JSON Oculto (__NEXT_DATA__) encontrado! Extraindo dados...")
-                    json_str = match.group(1)
-                    data = json.loads(json_str)
-                    
-                    # Função recursiva para achar "media" onde quer que ela esteja escondida
-                    def find_media_in_json(obj):
-                        found = []
+        # --- FASE 1: ACESSO À PÁGINA (VISUAL) ---
+        print(f"🕵️‍♂️ Acessando perfil: {username}...")
+        try:
+            resp = await s.get(f"https://privacy.com.br/profile/{username}")
+            html = resp.text
+            
+            # DIAGNÓSTICO DE BLOQUEIO (Olhe isso no Log!)
+            title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
+            page_title = title_match.group(1) if title_match else "Sem Título"
+            print(f"📄 Título da Página recebida: [{page_title}]")
+
+            if "Just a moment" in page_title or "Access denied" in html:
+                print("❌ BLOQUEIO DETECTADO: O Cloudflare barrou o IP do Railway.")
+                print("Solução: Tente gerar um NOVO cookie no seu PC e atualizar a variável COOKIE_MASTER.")
+                return []
+
+            # --- FASE 2: MINERAÇÃO DE DADOS (JSON) ---
+            print("⛏️ Minerando dados ocultos...")
+            # Regex super permissivo para achar o JSON do Next.js
+            json_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+            
+            if json_match:
+                try:
+                    data = json.loads(json_match.group(1))
+                    # Função que vasculha o JSON inteiro atrás de 'url' e 'type'
+                    def extract_recursive(obj):
                         if isinstance(obj, dict):
-                            # Se achou um objeto com url e type, é mídia
                             if "url" in obj and "type" in obj:
-                                if "video" in obj["type"] or "image" in obj["type"]:
-                                    found.append(obj)
-                            # Continua procurando dentro do dicionário
-                            for v in obj.values():
-                                found.extend(find_media_in_json(v))
+                                if obj["type"] in ["video", "image"]:
+                                    add_media(obj["url"], obj["type"], obj.get("id"))
+                            for k, v in obj.items():
+                                extract_recursive(v)
                         elif isinstance(obj, list):
                             for item in obj:
-                                found.extend(find_media_in_json(item))
-                        return found
+                                extract_recursive(item)
                     
-                    # Extrai tudo que parece mídia desse JSON gigante
-                    raw_media = find_media_in_json(data)
-                    
-                    for item in raw_media:
-                        # Limpa URLs
-                        clean_url = item["url"].replace("\\", "")
-                        media_list.append({
-                            "id": item.get("id", "json_found"),
-                            "url": clean_url,
-                            "type": item.get("type")
-                        })
-                else:
-                    print("❌ JSON Oculto não encontrado. O site pode ter mudado a estrutura.")
+                    extract_recursive(data)
+                    print(f"✅ Mineração JSON encontrou {len(media_list)} itens.")
+                except:
+                    print("⚠️ JSON encontrado mas falhou ao ler.")
 
-            except Exception as e:
-                print(f"Erro na leitura da página: {e}")
+            # --- FASE 3: VARREDURA BRUTA (REGEX) ---
+            # Se o JSON falhar, procuramos links de video na força bruta
+            print("🔍 Varrendo código-fonte por links soltos...")
+            
+            # Padrão para vídeos MP4 e M3U8 (comum em streaming)
+            video_pattern = re.compile(r'(https?://[^"\']+\.(?:mp4|m3u8))')
+            for v in video_pattern.findall(html):
+                add_media(v, "video", "regex_video")
 
-        # --- FILTRO FINAL (A Correção da Mira) 🎯 ---
-        # Remove lixo (logos, avatares, favicons) e duplicados
-        clean_list = []
-        seen_urls = set()
+            # Padrão para imagens (JPG, PNG, WEBP)
+            image_pattern = re.compile(r'(https?://[^"\']+\.(?:jpg|jpeg|png|webp))')
+            for img in image_pattern.findall(html):
+                add_media(img, "image", "regex_image")
+
+        except Exception as e:
+            print(f"🔥 Erro crítico na varredura: {e}")
+
+        # Função auxiliar para filtrar e adicionar
+        def add_media(url, mtype, mid="unknown"):
+            # LIMPEZA DE URL
+            url = url.replace("\\u002F", "/").replace("\\", "")
+            
+            # --- FILTRO DE LIXO (LISTA NEGRA) ---
+            # Ignora logos, ícones, avatares e scripts
+            blacklist = ["privacy-og", "avatar", "favicon", "logo", "icon", "svg", "static"]
+            if any(bad in url for bad in blacklist):
+                return
+            
+            if url not in found_urls:
+                media_list.append({"id": str(mid), "url": url, "type": mtype})
+                found_urls.add(url)
+
+        # --- RESUMO FINAL ---
+        print(f"🧹 Filtragem concluída. Total válido: {len(media_list)}")
         
-        print(f"🧹 Filtrando {len(media_list)} itens encontrados...")
+        if len(media_list) == 0:
+            print("⚠️ Nenhuma mídia encontrada. Dica: Se o título foi 'Privacy | ...', o perfil pode estar vazio para visitantes.")
+            
+        return media_list
+
+# Necessário definir a função auxiliar fora ou dentro (coloquei dentro da lógica acima, mas ajustei aqui para funcionar no escopo)
+# Ajuste: A função add_media precisa estar acessível. No código acima, ela foi definida depois do uso (o que daria erro).
+# VOU REESCREVER A ESTRUTURA PARA FICAR PERFEITA:
+
+async def list_media(username: str):
+    username = username.lower()
+    cookie_data = r.get("privacy_cookies")
+    if not cookie_data: return []
+    cookies = json.loads(cookie_data)
+
+    media_list = []
+    found_urls = set()
+
+    def add_media(url, mtype, mid="unknown"):
+        if not url: return
+        url = url.replace("\\u002F", "/").replace("\\", "")
+        blacklist = ["privacy-og", "avatar", "favicon", "logo", "icon", "svg", "static", "placeholder"]
+        if any(bad in url for bad in blacklist): return
+        if url not in found_urls:
+            media_list.append({"id": str(mid)[-10:], "url": url, "type": mtype})
+            found_urls.add(url)
+
+    async with AsyncSession(cookies=cookies, impersonate="chrome") as s:
+        s.headers.update({"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Referer": f"https://privacy.com.br/profile/{username}"})
         
-        for m in media_list:
-            u = m["url"]
-            # LISTA NEGRA: O que NÃO queremos baixar
-            if "privacy-og.jpg" in u or "avatar" in u or "favicon" in u or "logo" in u or ".svg" in u:
-                continue
-                
-            if u not in seen_urls:
-                clean_list.append(m)
-                seen_urls.add(u)
+        print(f"🕵️‍♂️ Acessando perfil: {username}...")
+        try:
+            resp = await s.get(f"https://privacy.com.br/profile/{username}")
+            html = resp.text
+            
+            # Debug Título
+            title = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
+            print(f"📄 Título: [{title.group(1) if title else '?'}]")
 
-        if clean_list:
-            print(f"🎉 SUCESSO! {len(clean_list)} mídias VÁLIDAS prontas para download.")
-        else:
-            print("⚠️ Nenhuma mídia válida encontrada (apenas logos/lixo foram filtrados).")
+            # 1. Busca JSON
+            json_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group(1))
+                    def extract(obj):
+                        if isinstance(obj, dict):
+                            if "url" in obj and "type" in obj and obj["type"] in ["video", "image"]:
+                                add_media(obj["url"], obj["type"], obj.get("id"))
+                            for v in obj.values(): extract(v)
+                        elif isinstance(obj, list):
+                            for i in obj: extract(i)
+                    extract(data)
+                except: pass
+            
+            # 2. Busca Regex (Backup)
+            for v in re.findall(r'(https?://[^"\'\s]+\.mp4)', html):
+                add_media(v, "video", "regex")
+            for i in re.findall(r'(https?://[^"\'\s]+\.(?:jpg|png))', html):
+                add_media(i, "image", "regex")
 
-        return clean_list
+        except Exception as e:
+            print(f"Erro: {e}")
+
+        print(f"🎉 Resultado: {len(media_list)} mídias prontas.")
+        return media_list
