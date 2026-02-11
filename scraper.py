@@ -1,4 +1,4 @@
-import os, redis, json
+import os, redis, json, re
 from curl_cffi.requests import AsyncSession
 
 r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
@@ -16,75 +16,84 @@ async def list_media(username: str):
 
     # 2. Sessão Chrome
     async with AsyncSession(cookies=cookies, impersonate="chrome120") as s:
-        print(f"Acessando perfil visual: {username}...")
-        
-        # Vamos direto na página do perfil (já que a API redireciona pra lá mesmo)
+        print(f"Rastreando mídia no perfil: {username}...")
         url = f"https://privacy.com.br/profile/{username}"
         
         try:
             resp = await s.get(url)
-            
-            # 3. Procura os dados escondidos no HTML
             html = resp.text
-            
-            # O tesouro está dentro da tag <script id="__NEXT_DATA__">
-            start_tag = '<script id="__NEXT_DATA__" type="application/json">'
-            end_tag = '</script>'
-            
-            start_index = html.find(start_tag)
-            if start_index == -1:
-                print(f"ERRO: Tag de dados não encontrada. Título da página: {html[html.find('<title>'):html.find('</title>')]}")
+
+            # Debug: Se o título for de erro, nem tenta
+            if "Just a moment" in html or "Access denied" in html:
+                print("ERRO: Bloqueio do Cloudflare detectado na página HTML.")
                 return []
-            
-            # Recorta só o JSON
-            json_start = start_index + len(start_tag)
-            json_end = html.find(end_tag, json_start)
-            json_str = html[json_start:json_end]
-            
-            data = json.loads(json_str)
-            
-            # 4. Navega pelo JSON para achar a mídia
-            # A estrutura muda às vezes, então vamos tentar vários caminhos
+
             media_list = []
+            seen_ids = set() # Para evitar duplicados
+
+            # --- ESTRATÉGIA 1: BUSCA BRUTA POR LINKS DE VÍDEO/IMAGEM ---
+            # Procura por padrões: "url":"https://..."
+            # O Regex captura qualquer URL que comece com https e termine com aspas
+            print("Iniciando varredura via Regex...")
             
-            # Caminho 1: Dados do Perfil Direto
-            try:
-                profile_data = data["props"]["pageProps"]["initialState"]["profile"]
-                if "media" in profile_data:
-                    raw_media = profile_data["media"]
-                else:
-                    # Caminho 2: React Query (Dehydrated State) - Mais comum hoje em dia
-                    queries = data["props"]["pageProps"]["dehydratedState"]["queries"]
-                    raw_media = []
-                    for q in queries:
-                        # Procura a query que tem dados de 'media' ou 'feed'
-                        if "state" in q and "data" in q["state"]:
-                            content = q["state"]["data"]
-                            # Pode estar dentro de 'profile' -> 'media'
-                            if "profile" in content and "media" in content["profile"]:
-                                raw_media.extend(content["profile"]["media"])
-                            # Ou pode ser uma lista de posts direta
-                            elif "value" in content and isinstance(content["value"], list):
-                                # Verifica se parece post de feed
-                                raw_media.extend(content["value"])
-
-            except Exception as e:
-                print(f"Aviso: Falha ao navegar na estrutura padrão ({e}). Tentando busca bruta...")
-                raw_media = []
-
-            # 5. Extrai os links limpos
-            # Agora varremos o que achamos para pegar só id e url
-            for item in raw_media:
-                # Se for estrutura de Mídia direta
-                if "url" in item and "type" in item:
-                     media_list.append(item)
+            # Padrão para pegar objetos de arquivo: {"id":"...","url":"..."}
+            # Isso é mais seguro que pegar qualquer link solto
+            # Procura por blocos que tenham 'url' e 'type' próximos
+            pattern = re.compile(r'"id":"(.*?)".*?"url":"(https://[^"]+)".*?"type":"(.*?)"')
+            
+            matches = pattern.findall(html)
+            
+            for m in matches:
+                media_id, media_url, media_type = m
                 
-                # Se for estrutura de Post (tem arquivos dentro)
-                elif "files" in item:
-                    for f in item["files"]:
-                        media_list.append(f)
+                # Limpa escapes de barra invertida (ex: https:\/\/ -> https://)
+                media_url = media_url.replace("\\u002F", "/").replace("\\", "")
+                
+                if media_id not in seen_ids:
+                    # Filtra apenas o que interessa (video/image)
+                    if media_type in ["video", "image"]:
+                        media_list.append({
+                            "id": media_id,
+                            "url": media_url,
+                            "type": media_type
+                        })
+                        seen_ids.add(media_id)
 
-            print(f"🎉 SUCESSO ABSOLUTO! {len(media_list)} mídias encontradas na página.")
+            # --- ESTRATÉGIA 2: JSON (FALLBACK RELAXADO) ---
+            # Se o Regex falhar, tentamos achar o JSON de forma mais genérica
+            if not media_list:
+                print("Regex não achou nada. Tentando busca profunda no JSON...")
+                try:
+                    # Procura apenas pelo ID, sem se importar com o type="application/json"
+                    if 'id="__NEXT_DATA__"' in html:
+                        start = html.find('id="__NEXT_DATA__"')
+                        json_start = html.find('>', start) + 1
+                        json_end = html.find('</script>', json_start)
+                        json_str = html[json_start:json_end]
+                        data = json.loads(json_str)
+                        
+                        # Tenta navegar até a mídia (vários caminhos possíveis)
+                        def extract_media(obj):
+                            if isinstance(obj, dict):
+                                if "url" in obj and "type" in obj and ("video" in obj["type"] or "image" in obj["type"]):
+                                    clean_url = obj["url"].replace("\\", "")
+                                    if clean_url not in [m["url"] for m in media_list]:
+                                        media_list.append({
+                                            "id": obj.get("id", "unknown"),
+                                            "url": clean_url,
+                                            "type": obj["type"]
+                                        })
+                                for k, v in obj.items():
+                                    extract_media(v)
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    extract_media(item)
+                        
+                        extract_media(data)
+                except Exception as e:
+                    print(f"Erro na busca profunda: {e}")
+
+            print(f"🎉 RASTREIO CONCLUÍDO! {len(media_list)} mídias encontradas.")
             return media_list
 
         except Exception as e:
