@@ -9,6 +9,9 @@ from uploader import send_tg
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+# Pega o Chat ID das variáveis de ambiente
+DEFAULT_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 app = FastAPI()
 bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
 r = redis.from_url(REDIS_URL)
@@ -28,37 +31,46 @@ def health():
     return {"status": "ok"}
 
 @app.post("/grab")
-async def grab(profile: str, chat_id: int):
-    # 1. Tenta Logar
+async def grab(profile: str, chat_id: str = None):
+    # Se não informar chat_id na URL, usa o da variável de ambiente
+    target_chat_id = chat_id if chat_id else DEFAULT_CHAT_ID
+    
+    if not target_chat_id:
+        return {"ok": 0, "msg": "ERRO: TELEGRAM_CHAT_ID não definido nas variáveis e nem na URL."}
+
+    # 1. Login (Verifica cookies)
     email = os.getenv("PRIV_EMAIL")
     senha = os.getenv("PRIV_PASS")
     
-    # Debug: Mostra no log se as variáveis estão vazias (sem mostrar a senha)
-    if not email:
-        print("ALERTA: Variável PRIV_EMAIL está vazia!")
-    
+    # O auth.py atual já cuida da limpeza, só chamamos para garantir
     jar = await login_privacy(email, senha)
-    
-    # TRAVA DE SEGURANÇA: Se o login falhou, aborta a missão.
     if not jar:
-        return {"ok": 0, "msg": "ERRO DE LOGIN: Verifique o log do Railway para ver o motivo (Senha errada? Captcha?)"}
+        return {"ok": 0, "msg": "Falha no login/cookies."}
     
     # 2. Lista mídias
-    print(f"Buscando mídia de {profile}...")
+    print(f"🚀 Iniciando extração para: {profile}")
     media = await list_media(profile)
     
     if not media:
-        return {"ok": 0, "msg": "Nenhuma mídia encontrada (Perfil vazio ou bloqueio)"}
+        return {"ok": 0, "msg": "Nenhuma mídia encontrada."}
     
-    # 3. Baixa e envia
+    # 3. Baixa e Envia
     count = 0
+    print(f"📤 Preparando envio para ID: {target_chat_id}")
+    
+    # Limite de 5 para não travar o servidor, aumente depois se quiser
     for m in media[:5]:
-        try:
-            tmp = await download(m["url"])
-            if tmp:
-                await send_tg(chat_id, tmp, m["id"])
+        tmp_path = await download(m["url"])
+        
+        if tmp_path:
+            try:
+                print(f"✈️ Enviando para Telegram...")
+                await send_tg(target_chat_id, tmp_path, caption=f"Mídia ID: {m['id']}")
                 count += 1
-        except Exception as e:
-            print(f"Erro no envio: {e}")
+                print("✅ Enviado!")
+            except Exception as e:
+                print(f"❌ Erro ao enviar pro Telegram: {e}")
+        else:
+            print("Pulei envio (download falhou).")
             
     return {"ok": count, "total_encontrado": len(media)}
