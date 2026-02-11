@@ -27,11 +27,14 @@ def health():
 @app.post("/grab")
 async def grab(profile: str, chat_id: int):
     # 1. login (cookie fica 1 h no Redis)
-    jar = await login_privacy(os.getenv("PRIV_USER"), os.getenv("PRIV_PASS"))
+    # ATENÇÃO: Lembre-se de criar a variável PRIV_EMAIL no Railway!
+    jar = await login_privacy(os.getenv("PRIV_EMAIL"), os.getenv("PRIV_PASS"))
+    
     # 2. lista mídias
     media = await list_media(profile)
     if not media:
         return {"ok": 0, "msg": "nenhuma mídia"}
+    
     # 3. baixa e envia
     for m in media[:5]:
         tmp = await download(m["url"])
